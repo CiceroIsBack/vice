@@ -45,7 +45,7 @@ type NewSimConfiguration struct {
 	lg             *log.Logger
 
 	// UI state
-	newSimType       int32
+	newSimType       newSimType
 	connectionConfig server.SimConnectionConfiguration
 
 	mu              util.LoggingMutex // protects airportMETAR/fetchingMETAR
@@ -83,9 +83,10 @@ func (c *NewSimConfiguration) SetTRACON(name string) {
 		c.selectedTRACONConfigs = configs[name]
 	}
 	c.TRACONName = name
-	c.GroupName = util.SortedMapKeys(c.selectedTRACONConfigs)[0]
+	var groupConfig *server.Configuration
+	c.GroupName, groupConfig = util.FirstSortedMapEntry(c.selectedTRACONConfigs)
 
-	c.SetScenario(c.GroupName, c.selectedTRACONConfigs[c.GroupName].DefaultScenario)
+	c.SetScenario(c.GroupName, groupConfig.DefaultScenario)
 }
 
 func (c *NewSimConfiguration) SetScenario(groupName, scenarioName string) {
@@ -93,8 +94,7 @@ func (c *NewSimConfiguration) SetScenario(groupName, scenarioName string) {
 	var groupConfig *server.Configuration
 	if groupConfig, ok = c.selectedTRACONConfigs[groupName]; !ok {
 		c.lg.Errorf("%s: group not found in TRACON %s", groupName, c.TRACONName)
-		groupName = util.SortedMapKeys(c.selectedTRACONConfigs)[0]
-		groupConfig = c.selectedTRACONConfigs[c.GroupName]
+		groupName, groupConfig = util.FirstSortedMapEntry(c.selectedTRACONConfigs)
 	}
 	c.GroupName = groupName
 
@@ -155,16 +155,67 @@ func (c *NewSimConfiguration) fetchMETAR() {
 
 const (
 	NewSimCreateLocal = iota
-	NewSimCreateRemote
+	NewSimCreateRemoteSingle
+	NewSimCreateRemoteMulti
 	NewSimJoinRemote
 )
+
+type newSimType int32
+
+func (n newSimType) String() string {
+	return []string{
+		"Create local single-controller sim",
+		"Create single-controller sim on public vice server",
+		"Create multi-controller sim on public vice server",
+		"Join multi-controller sim on public vice server"}[n]
+}
 
 func (c *NewSimConfiguration) UIButtonText() string {
 	return util.Select(c.newSimType == NewSimJoinRemote, "Join", "Next")
 }
 
 func (c *NewSimConfiguration) ShowRatesWindow() bool {
-	return c.newSimType == NewSimCreateLocal || c.newSimType == NewSimCreateRemote
+	return c.newSimType != NewSimJoinRemote
+}
+
+// facilityHasMatchingScenarios checks if a facility has any scenarios matching the current sim type filter
+func (c *NewSimConfiguration) facilityHasMatchingScenarios(facility string, configsByFacility map[string]map[string]*server.Configuration) bool {
+	groups := configsByFacility[facility]
+	for _, group := range groups {
+		if c.groupHasMatchingScenarios(group) {
+			return true
+		}
+	}
+	return false
+}
+
+// groupHasMatchingScenarios checks if a group has any scenarios matching the current sim type filter
+func (c *NewSimConfiguration) groupHasMatchingScenarios(group *server.Configuration) bool {
+	if group == nil || group.ScenarioConfigs == nil {
+		return false
+	}
+	for _, scenarioConfig := range group.ScenarioConfigs {
+		if c.scenarioMatchesFilter(scenarioConfig) {
+			return true
+		}
+	}
+	return false
+}
+
+// scenarioMatchesFilter checks if a scenario matches the current sim type filter
+func (c *NewSimConfiguration) scenarioMatchesFilter(scenarioConfig *server.SimScenarioConfiguration) bool {
+	if c.newSimType == NewSimCreateLocal || c.newSimType == NewSimCreateRemoteSingle {
+		// Single-controller mode; all scenarios are valid.
+		return true
+	} else if c.newSimType == NewSimCreateRemoteMulti {
+		// Multi-controller mode
+		numControllers := 0
+		if defaultSplit, ok := scenarioConfig.SplitConfigurations["default"]; ok {
+			numControllers = len(defaultSplit)
+		}
+		return numControllers > 1
+	}
+	return true
 }
 
 func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
@@ -206,23 +257,26 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 
 			origType := c.newSimType
 
-			imgui.TableNextColumn()
-			if imgui.RadioButtonIntPtr("Create local single-controller sim", &c.newSimType, NewSimCreateLocal) &&
-				origType != NewSimCreateLocal {
-				c.selectedServer = c.mgr.LocalServer
-				c.SetTRACON(*c.defaultTRACON)
-				c.displayError = nil
+			doButton := func(ty newSimType, srv *client.Server) {
+				if imgui.RadioButtonIntPtr(ty.String(), (*int32)(&c.newSimType), int32(ty)) && origType != ty {
+					c.selectedServer = srv
+					c.SetTRACON(c.TRACONName)
+					c.displayError = nil
+				}
 			}
+
+			imgui.TableNextColumn()
+			doButton(NewSimCreateLocal, c.mgr.LocalServer)
 
 			imgui.TableNextRow()
 			imgui.TableNextColumn()
 			imgui.TableNextColumn()
-			if imgui.RadioButtonIntPtr("Create multi-controller sim on public vice server", &c.newSimType, NewSimCreateRemote) &&
-				origType != NewSimCreateRemote {
-				c.selectedServer = c.mgr.RemoteServer
-				c.SetTRACON(*c.defaultTRACON)
-				c.displayError = nil
-			}
+			doButton(NewSimCreateRemoteSingle, c.mgr.RemoteServer)
+
+			imgui.TableNextRow()
+			imgui.TableNextColumn()
+			imgui.TableNextColumn()
+			doButton(NewSimCreateRemoteMulti, c.mgr.RemoteServer)
 
 			imgui.TableNextRow()
 			imgui.TableNextColumn()
@@ -231,14 +285,10 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 			if len(runningSims) == 0 {
 				imgui.BeginDisabled()
 				if c.newSimType == NewSimJoinRemote {
-					c.newSimType = NewSimCreateRemote
+					c.newSimType = NewSimCreateRemoteMulti
 				}
 			}
-			if imgui.RadioButtonIntPtr("Join multi-controller sim on public vice server", &c.newSimType, NewSimJoinRemote) &&
-				origType != NewSimJoinRemote {
-				c.selectedServer = c.mgr.RemoteServer
-				c.displayError = nil
-			}
+			doButton(NewSimJoinRemote, c.mgr.RemoteServer)
 			if len(runningSims) == 0 {
 				imgui.EndDisabled()
 			}
@@ -254,7 +304,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 	}
 	imgui.Separator()
 
-	if c.newSimType == NewSimCreateLocal || c.newSimType == NewSimCreateRemote {
+	if c.newSimType == NewSimCreateLocal || c.newSimType == NewSimCreateRemoteMulti || c.newSimType == NewSimCreateRemoteSingle {
 		flags := imgui.TableFlagsBordersV | imgui.TableFlagsBordersOuterH | imgui.TableFlagsRowBg |
 			imgui.TableFlagsSizingStretchProp
 		tableScale := util.Select(runtime.GOOS == "windows", p.DPIScale(), float32(1))
@@ -290,6 +340,10 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 				if info == nil {
 					continue
 				}
+				// Only include ARTCCs that have at least one facility with matching scenarios
+				if !c.facilityHasMatchingScenarios(facility, configsByFacility) {
+					continue
+				}
 				artcc := info.ARTCC
 				if artcc == "" {
 					if traconInfo, ok := av.DB.TRACONs[facility]; ok {
@@ -303,7 +357,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 
 			imgui.TableNextColumn()
 			if imgui.BeginChildStrV("artccs", imgui.Vec2{tableScale * 150, tableScale * 350}, 0, imgui.WindowFlagsNoResize) {
-				for _, artcc := range util.SortedMapKeys(artccs) {
+				for artcc := range util.SortedMap(artccs) {
 					name := av.DB.ARTCCs[artcc].Name
 					name = strings.TrimSuffix(name, " ARTCC")
 					name = strings.TrimSuffix(name, " Center")
@@ -368,13 +422,29 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 					}
 
 					if _, isTRACON := av.DB.TRACONs[facility]; isTRACON {
+						// Check if any group in this TRACON has matching scenarios
+						groups := configsByFacility[facility]
+						hasAnyMatchingScenarios := false
+						for _, group := range groups {
+							if c.groupHasMatchingScenarios(group) {
+								hasAnyMatchingScenarios = true
+								break
+							}
+						}
+						if !hasAnyMatchingScenarios {
+							continue
+						}
 						label := facilityLabel(facility, info)
 						if imgui.SelectableBoolV(label, facility == c.TRACONName, 0, imgui.Vec2{}) && facility != c.TRACONName {
 							c.SetTRACON(facility)
 						}
 						if facility == c.TRACONName {
 							groups := configsByFacility[facility]
-							for _, groupName := range util.SortedMapKeys(groups) {
+							for groupName, group := range util.SortedMap(groups) {
+								// Only show groups with matching scenarios
+								if !c.groupHasMatchingScenarios(group) {
+									continue
+								}
 								groupLabel := "  " + groupName
 								selected := groupName == c.GroupName
 								if imgui.SelectableBoolV(groupLabel, selected, 0, imgui.Vec2{}) {
@@ -388,19 +458,18 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 					}
 
 					groups := configsByFacility[facility]
-					for _, groupName := range util.SortedMapKeys(groups) {
-						gcfg := groups[groupName]
+					for groupName, gcfg := range util.SortedMap(groups) {
+						// Only show ARTCC areas with matching scenarios
+						if !c.groupHasMatchingScenarios(gcfg) {
+							continue
+						}
 						area := strings.TrimSpace(gcfg.Area)
 						if area != "" {
 							area = strings.TrimSuffix(area, " ARTCC")
 							area = strings.TrimSuffix(area, " Center")
 						}
-						label := facility
-						if area != "" {
-							label = fmt.Sprintf("%s %s", facility, area)
-						} else {
-							label = facilityLabel(facility, info)
-						}
+
+						label := util.Select(area != "", fmt.Sprintf("%s %s", facility, area), facilityLabel(facility, info))
 
 						selected := facility == c.TRACONName && groupName == c.GroupName
 						if imgui.SelectableBoolV(label, selected, 0, imgui.Vec2{}) {
@@ -420,10 +489,14 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 			// Scenarios for the selected TRACON or area
 			imgui.TableNextColumn()
 			if imgui.BeginChildStrV("scenarios", imgui.Vec2{tableScale * 300, tableScale * 350}, 0, imgui.WindowFlagsNoResize) {
-				if group := c.selectedTRACONConfigs[c.GroupName]; group != nil {
-					for _, name := range util.SortedMapKeys(group.ScenarioConfigs) {
-						if imgui.SelectableBoolV(name, name == c.ScenarioName, 0, imgui.Vec2{}) {
-							c.SetScenario(c.GroupName, name)
+				group := c.selectedTRACONConfigs[c.GroupName]
+				if group != nil {
+					for name, scenarioConfig := range util.SortedMap(group.ScenarioConfigs) {
+						// Filter scenarios based on newSimType
+						if c.scenarioMatchesFilter(scenarioConfig) {
+							if imgui.SelectableBoolV(name, name == c.ScenarioName, 0, imgui.Vec2{}) {
+								c.SetScenario(c.GroupName, name)
+							}
 						}
 					}
 				}
@@ -449,7 +522,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 			}
 		}
 
-		if c.newSimType == NewSimCreateRemote {
+		if c.newSimType == NewSimCreateRemoteMulti || c.newSimType == NewSimCreateRemoteSingle {
 			imgui.Text("Name: " + c.NewSimName)
 		}
 
@@ -484,7 +557,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 
 		imgui.Text("Control Position: " + fmtPosition(c.ScenarioConfig.SelectedController))
 
-		if c.newSimType == NewSimCreateRemote {
+		if c.newSimType == NewSimCreateRemoteMulti || c.newSimType == NewSimCreateRemoteSingle {
 			// Various extras only for remote sims
 			imgui.Checkbox("Allow Instructor/RPO Sign-ins", &c.AllowInstructorRPO)
 
@@ -582,9 +655,8 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 		// Join remote
 		rs, ok := runningSims[c.connectionConfig.RemoteSim]
 		if !ok || c.connectionConfig.RemoteSim == "" {
-			c.connectionConfig.RemoteSim = util.SortedMapKeys(runningSims)[0]
+			c.connectionConfig.RemoteSim, rs = util.FirstSortedMapEntry(runningSims)
 
-			rs = runningSims[c.connectionConfig.RemoteSim]
 			if _, ok := rs.CoveredPositions[rs.PrimaryController]; !ok {
 				// If the primary position isn't currently covered, make that the default selection.
 				c.connectionConfig.Position = rs.PrimaryController
@@ -601,8 +673,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 			imgui.TableSetupColumn("Controllers")
 			imgui.TableHeadersRow()
 
-			for _, simName := range util.SortedMapKeys(runningSims) {
-				rs := runningSims[simName]
+			for simName, rs := range util.SortedMap(runningSims) {
 				if len(rs.AvailablePositions) == 0 {
 					// No open positions left; don't even offer it.
 					continue
@@ -648,7 +719,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 
 		// Handle the case of someone else signing in to the position
 		if _, ok := rs.AvailablePositions[c.connectionConfig.Position]; !ok {
-			c.connectionConfig.Position = util.SortedMapKeys(rs.AvailablePositions)[0]
+			c.connectionConfig.Position, _ = util.FirstSortedMapEntry(rs.AvailablePositions)
 		}
 
 		fmtPosition := func(id string) string {
@@ -659,7 +730,7 @@ func (c *NewSimConfiguration) DrawUI(p platform.Platform, config *Config) bool {
 		}
 
 		if imgui.BeginCombo("Position", fmtPosition(c.connectionConfig.Position)) {
-			for _, pos := range util.SortedMapKeys(rs.AvailablePositions) {
+			for pos := range util.SortedMap(rs.AvailablePositions) {
 				if pos[0] == '_' {
 					continue
 				}
@@ -703,7 +774,7 @@ func (c *NewSimConfiguration) DrawRatesUI(p platform.Platform) bool {
 }
 
 func (c *NewSimConfiguration) OkDisabled() bool {
-	return c.newSimType == NewSimCreateRemote && (c.NewSimName == "" || (c.RequirePassword && c.Password == ""))
+	return (c.newSimType == NewSimCreateRemoteMulti || c.newSimType == NewSimCreateRemoteSingle) && (c.NewSimName == "" || (c.RequirePassword && c.Password == ""))
 }
 
 func (c *NewSimConfiguration) Start() error {
@@ -769,17 +840,17 @@ func drawDepartureUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) {
 		}
 		imgui.TableHeadersRow()
 
-		for _, airport := range util.SortedMapKeys(lc.DepartureRates) {
+		for airport := range util.SortedMap(lc.DepartureRates) {
 			imgui.TableNextRow()
 			imgui.TableNextColumn()
 			imgui.Text(airport)
 
 			imgui.PushIDStr(airport)
 			adrColumn := 0
-			for _, runway := range util.SortedMapKeys(lc.DepartureRates[airport]) {
+			for runway := range util.SortedMap(lc.DepartureRates[airport]) {
 				imgui.PushIDStr(runway)
 
-				for _, category := range util.SortedMapKeys(lc.DepartureRates[airport][runway]) {
+				for category := range util.SortedMap(lc.DepartureRates[airport][runway]) {
 					imgui.TableNextColumn()
 					rshort, _, _ := strings.Cut(runway, ".") // don't include extras in the UI
 					imgui.Text(rshort)
@@ -911,16 +982,16 @@ func drawArrivalUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) {
 		}
 		imgui.TableHeadersRow()
 
-		for _, ap := range util.SortedMapKeys(numAirportFlows) {
+		for ap := range util.SortedMap(numAirportFlows) {
 			imgui.PushIDStr(ap)
 			imgui.TableNextRow()
 			imgui.TableNextColumn()
 			imgui.Text(ap)
 
 			aarCol := 0
-			for _, group := range util.SortedMapKeys(lc.InboundFlowRates) {
+			for group, aprates := range util.SortedMap(lc.InboundFlowRates) {
 				imgui.PushIDStr(group)
-				if rate, ok := lc.InboundFlowRates[group][ap]; ok {
+				if rate, ok := aprates[ap]; ok {
 					if aarCol > 0 && aarCol%aarColumns == 0 {
 						// Overflow
 						imgui.TableNextRow()
@@ -979,7 +1050,7 @@ func drawOverflightUI(lc *sim.LaunchConfig, p platform.Platform) (changed bool) 
 		imgui.TableSetupColumn("Rate")
 		imgui.TableHeadersRow()
 
-		for _, group := range util.SortedMapKeys(overflightGroups) {
+		for group := range util.SortedMap(overflightGroups) {
 			imgui.PushIDStr(group)
 			imgui.TableNextRow()
 			imgui.TableNextColumn()
@@ -1040,10 +1111,9 @@ func MakeLaunchControlWindow(client *client.ControlClient, lg *log.Logger) *Laun
 	lc := &LaunchControlWindow{client: client, lg: lg}
 
 	config := &client.State.LaunchConfig
-	for _, airport := range util.SortedMapKeys(config.DepartureRates) {
-		runwayRates := config.DepartureRates[airport]
-		for _, rwy := range util.SortedMapKeys(runwayRates) {
-			for _, category := range util.SortedMapKeys(runwayRates[rwy]) {
+	for airport, runwayRates := range util.SortedMap(config.DepartureRates) {
+		for rwy, rates := range util.SortedMap(runwayRates) {
+			for category := range util.SortedMap(rates) {
 				lc.departures = append(lc.departures, &LaunchDeparture{
 					LaunchAircraft: LaunchAircraft{Airport: airport},
 					Runway:         rwy,
@@ -1053,7 +1123,7 @@ func MakeLaunchControlWindow(client *client.ControlClient, lg *log.Logger) *Laun
 		}
 	}
 
-	for _, airport := range util.SortedMapKeys(config.VFRAirportRates) {
+	for airport := range util.SortedMap(config.VFRAirportRates) {
 		rwy := client.State.VFRRunways[airport]
 		lc.vfrDepartures = append(lc.vfrDepartures, &LaunchDeparture{
 			LaunchAircraft: LaunchAircraft{Airport: airport},
@@ -1061,8 +1131,8 @@ func MakeLaunchControlWindow(client *client.ControlClient, lg *log.Logger) *Laun
 		})
 	}
 
-	for _, group := range util.SortedMapKeys(config.InboundFlowRates) {
-		for ap := range config.InboundFlowRates[group] {
+	for group, apRates := range util.SortedMap(config.InboundFlowRates) {
+		for ap := range apRates {
 			lc.arrivalsOverflights = append(lc.arrivalsOverflights,
 				&LaunchArrivalOverflight{
 					LaunchAircraft: LaunchAircraft{Airport: ap},

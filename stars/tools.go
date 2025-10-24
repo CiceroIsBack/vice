@@ -439,12 +439,12 @@ func (sp *STARSPane) drawScenarioArrivalRoutes(ctx *panes.Context, transforms ra
 		DrawBackground: true}
 
 	if sp.scopeDraw.arrivals != nil {
-		for _, name := range util.SortedMapKeys(ctx.Client.State.InboundFlows) {
+		for name, flow := range util.SortedMap(ctx.Client.State.InboundFlows) {
 			if sp.scopeDraw.arrivals[name] == nil {
 				continue
 			}
 
-			arrivals := ctx.Client.State.InboundFlows[name].Arrivals
+			arrivals := flow.Arrivals
 			for i, arr := range arrivals {
 				if sp.scopeDraw.arrivals == nil || !sp.scopeDraw.arrivals[name][i] {
 					continue
@@ -453,9 +453,8 @@ func (sp *STARSPane) drawScenarioArrivalRoutes(ctx *panes.Context, transforms ra
 				radar.DrawWaypoints(ctx, arr.Waypoints, drawnWaypoints, transforms, td, style, ld, pd, ldr, color)
 
 				// Draw runway-specific waypoints
-				for _, ap := range util.SortedMapKeys(arr.RunwayWaypoints) {
-					for _, rwy := range util.SortedMapKeys(arr.RunwayWaypoints[ap]) {
-						wp := arr.RunwayWaypoints[ap][rwy]
+				for _, rwys := range util.SortedMap(arr.RunwayWaypoints) {
+					for rwy, wp := range util.SortedMap(rwys) {
 						radar.DrawWaypoints(ctx, wp, drawnWaypoints, transforms, td, style, ld, pd, ldr, color)
 
 						if len(wp) > 1 {
@@ -498,8 +497,7 @@ func (sp *STARSPane) drawScenarioApproachRoutes(ctx *panes.Context, transforms r
 				continue
 			}
 			ap := ctx.Client.State.Airports[rwy.Airport]
-			for _, name := range util.SortedMapKeys(ap.Approaches) {
-				appr := ap.Approaches[name]
+			for name, appr := range util.SortedMap(ap.Approaches) {
 				if appr.Runway == rwy.Runway && sp.scopeDraw.approaches[rwy.Airport][name] {
 					for _, wp := range appr.Waypoints {
 						radar.DrawWaypoints(ctx, wp, drawnWaypoints, transforms, td, style, ld, pd, ldr, color)
@@ -536,9 +534,9 @@ func (sp *STARSPane) drawScenarioDepartureRoutes(ctx *panes.Context, transforms 
 				}
 
 				exitRoutes := ap.DepartureRoutes[rwy]
-				for _, exit := range util.SortedMapKeys(exitRoutes) {
+				for exit, exitRoute := range util.SortedMap(exitRoutes) {
 					if sp.scopeDraw.departures[name][rwy][exit] {
-						radar.DrawWaypoints(ctx, exitRoutes[exit].Waypoints, drawnWaypoints, transforms,
+						radar.DrawWaypoints(ctx, exitRoute.Waypoints, drawnWaypoints, transforms,
 							td, style, ld, pd, ldr, color)
 					}
 				}
@@ -560,12 +558,12 @@ func (sp *STARSPane) drawScenarioOverflightRoutes(ctx *panes.Context, transforms
 		DrawBackground: true}
 
 	if sp.scopeDraw.overflights != nil {
-		for _, name := range util.SortedMapKeys(ctx.Client.State.InboundFlows) {
+		for name, flow := range util.SortedMap(ctx.Client.State.InboundFlows) {
 			if sp.scopeDraw.overflights[name] == nil {
 				continue
 			}
 
-			overflights := ctx.Client.State.InboundFlows[name].Overflights
+			overflights := flow.Overflights
 			for i, of := range overflights {
 				if sp.scopeDraw.overflights == nil || !sp.scopeDraw.overflights[name][i] {
 					continue
@@ -844,20 +842,26 @@ func (sp *STARSPane) drawWind(ctx *panes.Context, transforms radar.ScopeTransfor
 
 	ld := renderer.GetLinesDrawBuilder()
 	defer renderer.ReturnLinesDrawBuilder(ld)
-	td := renderer.GetTrianglesDrawBuilder()
-	defer renderer.ReturnTrianglesDrawBuilder(td)
+	txtd := renderer.GetTextDrawBuilder()
+	defer renderer.ReturnTextDrawBuilder(txtd)
 
-	// Wind barbs: https://www.weather.gov/hfo/windbarbinfo
-	const pix = 50
+	ps := sp.currentPrefs()
+	font := sp.systemFont(ctx, ps.CharSize.Tools)
+	color := ps.Brightness.Lines.RGB()
+
+	const arrowLength = 25
+	const arrowheadSize = 8
 	step := 1
-	if r := sp.currentPrefs().Range; r > 55 {
+	if r := ps.Range; r > 80 {
+		step = 4
+	} else if r > 45 {
 		step = 3
-	} else if r > 32 {
+	} else if r > 25 {
 		step = 2
 	}
 	for pll, samp := range sp.atmosGrid.SamplesAtLevel(sp.windDrawAltitudeIndex, step) {
-		// Round to nearest 5 knots
-		spd := int(samp.WindSpeed()+2.5) / 5 * 5
+		// Round to nearest integer knot
+		spd := int(samp.WindSpeed() + 0.5)
 
 		pw := transforms.WindowFromLatLongP(pll)
 		if spd <= 5 {
@@ -865,39 +869,33 @@ func (sp *STARSPane) drawWind(ctx *panes.Context, transforms radar.ScopeTransfor
 			continue
 		}
 
-		// Rotate so we can draw a canonical barb below
-		rot := math.Rotator2f(samp.WindDirection())
+		// Rotate so we can draw an arrow pointing in the wind direction;
+		// add an extra 180 so it points where the wind is blowing.
+		rot := math.Rotator2f(samp.WindDirection() + 180)
 
-		// Main line
-		ld.AddLine(math.Sub2f(pw, rot([2]float32{0, pix / 4})), math.Add2f(pw, rot([2]float32{0, pix / 4})))
-		pb := [2]float32{0, pix / 4}
-		for spd >= 50 {
-			// Triangle
-			v0 := math.Add2f(pw, rot(pb))
-			v1 := math.Add2f(pw, rot(math.Add2f(pb, [2]float32{0, -6})))
-			v2 := math.Add2f(pw, rot(math.Add2f(pb, [2]float32{pix / 4, -3})))
-			td.AddTriangle(v0, v1, v2)
-			pb[1] -= 6
-			spd -= 50
-		}
-		for spd >= 10 {
-			// long line
-			ld.AddLine(math.Add2f(pw, rot(pb)), math.Add2f(pw, rot(math.Add2f(pb, [2]float32{pix / 4, pix / 20}))))
-			pb[1] -= 3
-			spd -= 10
-		}
-		if spd >= 5 {
-			// short line
-			ld.AddLine(math.Add2f(pw, rot(pb)), math.Add2f(pw, rot(math.Add2f(pb, [2]float32{pix / 8, pix / 40}))))
-		}
+		// Draw arrow shaft
+		shaftStart := math.Add2f(pw, rot([2]float32{0, -arrowLength / 2}))
+		shaftEnd := math.Add2f(pw, rot([2]float32{0, arrowLength / 2}))
+		ld.AddLine(shaftStart, shaftEnd)
+
+		// Draw arrowhead (two lines forming a V at the tip)
+		arrowTip := shaftEnd
+		leftBarb := math.Add2f(pw, rot([2]float32{-arrowheadSize / 2, arrowLength/2 - arrowheadSize}))
+		rightBarb := math.Add2f(pw, rot([2]float32{arrowheadSize / 2, arrowLength/2 - arrowheadSize}))
+		ld.AddLine(arrowTip, leftBarb)
+		ld.AddLine(arrowTip, rightBarb)
+
+		// Draw speed text below the arrow
+		textPos := math.Add2f(pw, rot([2]float32{0, -arrowLength/2 - 5}))
+		speedText := fmt.Sprintf("%d", spd)
+		txtd.AddTextCentered(speedText, textPos, renderer.TextStyle{Font: font, Color: color})
 	}
 
 	cb.LineWidth(1, ctx.DPIScale)
-	ps := sp.currentPrefs()
-	cb.SetRGB(ps.Brightness.Lines.RGB())
+	cb.SetRGB(color)
 	transforms.LoadWindowViewingMatrices(cb)
 	ld.GenerateCommands(cb)
-	td.GenerateCommands(cb)
+	txtd.GenerateCommands(cb)
 }
 
 type STARSRangeBearingLine struct {
